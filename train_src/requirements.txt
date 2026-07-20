@@ -1,0 +1,10 @@
+# 학습 환경 의존성 (추론 환경과 별개 — 추론은 제공 Docker만 사용)
+torch>=2.5
+torchvision
+ultralytics>=8.3
+opencv-python
+numpy
+onnx>=1.17
+onnxruntime
+onnxslim
+pyyaml

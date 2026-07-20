@@ -1,0 +1,116 @@
+detector:
+  type: onnx                    # dummy | onnx | ensemble
+  # 2026-07-16 오후, 마지막 제출 앞두고 detector_a로 최종 원복.
+  #
+  # 타임라인(전부 실증 근거 있음, TEAM_MERGE_2026-07-16.md 참고):
+  # - 2026-07-15: detector_a→detector_b 교체, 로컬 100개 12.96→12.46로 개선
+  #   확인해서 채택.
+  # - 2026-07-16 아침: max_bbox_area_frac(0.10) 추가로 로컬 12.412까지 개선 후
+  #   리더보드 제출 → 14.0042로 3차 제출(detector_a 기반, 13.9262)보다 악화.
+  # - "면적필터가 원인"이라고 처음 판단했으나, **면적필터 있음/없음 두 버전을
+  #   해시까지 검증하며 실제 public test 50개에 돌려본 결과 예측값이 완전히
+  #   동일(SHA256 일치, 다른 영상 0개)** — 면적필터는 이 50개에서 단 한 번도
+  #   발동 안 함. 즉 원인은 면적필터가 아니라 detector_b 자체(또는 그
+  #   conf_thresh/class_ids 조합)이며, detector_b+클램프만 조합도 아마
+  #   14.0042와 비슷하게 나올 것으로 추정(직접 제출로 확인은 안 함 — 제출
+  #   횟수 소진 방지).
+  # - 로컬 train 100개에서 detector_b가 detector_a보다 나았던 게(12.46 vs
+  #   12.96) hidden 계열 데이터에서는 뒤집힘(14.0042 vs 13.9262) —
+  #   detector_b가 train셋에 어느 정도 과적합했을 가능성. 로컬 검증만으로는
+  #   못 잡아낸 진짜 train-test 격차.
+  # - 마지막 제출 기회라 확실한 쪽(리더보드 13.9262로 실측된 detector_a
+  #   조합)으로 최종 원복. detector_b를 다시 시도한다면 반드시 리더보드로
+  #   직접 재검증할 것 — 로컬 100개 개선만으로 채택 금지.
+  model_path: checkpoints/detector_a.onnx
+  conf_thresh: 0.4              # detector_a 전용 값(3차 제출과 동일) — detector_b는 0.6이었음,
+                               # detector 바꾸면 반드시 재스윕(이 대회에서 세 번째로 반복 강조)
+  nms_thresh: 0.45
+  input_size: [1280, 1280]     # must match ONNX export imgsz (static shape)
+  class_ids: [2]                # detector_a classes: {0:'0', 1:'3', 2:'box'} → keep only 'box'
+                               # (주의: detector_b는 2-class라 class_ids: [1]이었음)
+  low_conf_thresh: 0.15         # ByteTrack 방식 2단계 매칭: conf_thresh 미만
+                               # ~ low_conf_thresh 사이 탐지는 새 트랙은 못 만들고
+                               # 기존 트랙 연장에만 쓰임 (train_013류: 특정 위치에서
+                               # confidence가 애매하게 낮아 깜빡이는 케이스 구제)
+  # ensemble path (used when type: ensemble) — WBF across independently
+  # trained detectors. detector_a/b showed COMPLEMENTARY error patterns on
+  # the count-mismatch SUBSET, but net-regressed on the full 100-video set —
+  # kept here for future reference/reuse, not currently active.
+  ensemble:
+    wbf_iou_thresh: 0.55
+    min_fused_score: 0.5        # 한쪽 모델만 잡은 박스는 원래 confidence가
+                                 # 높아야(>=0.5/weight 감쇠 후) 채택 — 안 그러면
+                                 # 두 모델 오탐이 합집합으로 다 살아남아 과다탐지 악화
+    models:
+      - model_path: checkpoints/detector_a.onnx   # original (팀원 제공, 3-class)
+        class_ids: [2]                            # classes: {0:'0', 1:'3', 2:'box'}
+        conf_thresh: 0.4
+        weight: 1.0
+      - model_path: checkpoints/detector_b.onnx   # 재학습(60에폭, 2-class)
+        class_ids: [1]                            # classes: {0:'3', 1:'box'}
+        conf_thresh: 0.4
+        weight: 1.0
+
+tracker:
+  type: sort                   # dummy | sort | bytetrack (bytetrack: not in Docker)
+  # sort parameters (used when type: sort)
+  max_age: 90                  # 30→90: 낮은 conf에서 늘어난 후보 탐지의 잡음 트랙 생존 억제
+  min_hits: 1
+  iou_threshold: 0.3
+  # bytetrack parameters (used when type: bytetrack)
+  track_thresh: 0.5
+  track_buffer: 30
+  match_thresh: 0.8
+  frame_rate: 30
+
+calibration:
+  type: dummy                  # dummy | rail | intrinsic
+  # dummy parameters
+  px_per_cm: 10.0
+  # rail parameters (used when type: rail)
+  known_rail_width_cm: 62.3    # official spec: rail width is ALWAYS 62.3cm
+  calibration_frame_count: 10
+  # intrinsic parameters (used when type: intrinsic — NOT default, needs train analysis)
+  assumed_distance_cm: 100.0   # placeholder, must be calibrated from train_label.json
+
+geometry:
+  type: regressor              # dummy | calibrated | multiframe | regressor
+  # regressor parameters (Dimension Regressor, C_regressor_train)
+  # ONNX per competition rule (all AI models must ship/load as ONNX).
+  # 2026-07-11: auto_match 확장 데이터(30,403샘플) + 순열 불변 손실로 재학습한
+  # 단일모델(seed42)로 교체. 하네스 실측 13.849 -> 12.96 (검증됨).
+  # 이전 3-model true-focal 앙상블은 checkpoints/regressor_ensemble_manual_BACKUP.onnx로 보존.
+  model_path: checkpoints/regressor.onnx
+  # FocalNet: 전체 프레임에서 focal 추정 (val: 0.84mm / rel 6.4% on unseen
+  # videos). 추정 focal + true-focal 앙상블 = 4.68cm vs 상수 focal 5.13cm.
+  focal_model_path: checkpoints/focalnet.onnx
+  focal_length_mm: 8.767       # fallback ONLY if focalnet unavailable
+                               # (= median focal of the 3418 training crops)
+  crop_quality_filter: false   # 실험적 기능 (미검증) — configs/crop_filter_test.yaml로
+                               # 별도 검증 중, 결과 확인 전까지 기본 false 유지
+  max_crops: 5                 # frames ensembled per box (median)
+  # multiframe / calibrated parameters
+  camera_tilt_deg: 30.0
+  depth_ratio: 0.6
+
+aggregator:
+  min_frames: 45               # 14영상 스윕(conf/max_age/min_frames 3D)에서 절대오차 총합 최소 조합
+  min_speed_px_per_frame: 0.0  # (구) 전역 속도 필터 — origin_filter로 대체됨.
+                               # 전역 속도컷은 원근 때문에 느려 보이는 먼 쪽 진짜
+                               # 박스(0.75px/f)와 오탐(0.76px/f)을 구분 못함이 실증됨.
+  # 출생지(origin) 필터: 진짜 박스는 (a) frame 0에 이미 벨트 위에 있거나
+  # (b) 화면 하단 진입선에서 등장해야 함 — 화면 중간에서 갑자기 생기면 유령.
+  # 근거: scripts/diagnose_fragmentation.py — 확인된 오탐 전부 영상 중간
+  # (f56~192) + 화면 중앙(y180~370) 출현, 진짜 박스는 전부 frame0 또는 y700+.
+  origin_filter:
+    enabled: true
+    entry_y_frac: 0.8          # 시작 cy >= 프레임높이*0.8 → 진입선 출생(진짜)
+    start_frame_grace: 10      # 시작 frame <= 10 → 영상 시작부터 존재
+    min_frames_entry: 25       # 진입선 출생 트랙은 min_frames 완화(45→25)
+                               # (진입 직후 가려진 진짜 박스 구제, train_002의 23f 트랙)
+    static_speed: 0.5          # frame0 출생이라도 이보다 느리면 정지 배경 오탐
+                               # (train_004 id=5: 0.24 제거, train_000 id=3: 0.75 유지)
+    ghost_speed: 0.9           # 중간 출현 트랙은 이보다 느리면 유령으로 제거
+
+output:
+  path: result.json            # informational only — main.py uses CLI --output
